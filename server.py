@@ -1,149 +1,65 @@
-import socket
-import threading
-import json
+from Crypto.PublicKey import RSA
+from Crypto.Cipher import PKCS1_OAEP, DES
+from Crypto.Util.Padding import pad, unpad
+import asyncio
+import websockets
 
 
-clients = {}
-public_keys = {}
-
-def handle_client(client_socket, address, client_id):
-    """Handles communication with a connected client."""
+def load_or_generate_rsa_keys(private_key_file, public_key_file):
     try:
-        print(f"Accepted connection from {address} with ID {client_id}")
+        with open(private_key_file, "rb") as f:
+            private_key = RSA.import_key(f.read())
+        print("Private key server berhasil dimuat.")
+    except FileNotFoundError:
+        private_key = RSA.generate(2048)
+        with open(private_key_file, "wb") as f:
+            f.write(private_key.export_key())
+        print("Private key baru berhasil dibuat.")
 
-        send_message(client_socket, {
-            'data': f"Welcome to the server! Your ID is {client_id}",
-            'client_id': client_id
-        })
+    public_key = private_key.publickey()
+    with open(public_key_file, "wb") as f:
+        f.write(public_key.export_key())
+    print("Public key server berhasil disimpan.")
+    return private_key, public_key
 
-       
-        public_key_data = receive_message(client_socket)
-        public_key = public_key_data.get('public_key')
 
- 
-        notify_clients(client_id, public_key)
+server_private_key, server_public_key = load_or_generate_rsa_keys("server_private.pem", "server_public.pem")
 
-        send_message(client_socket, {
-            'public_keys': public_keys,
-            'data': "Public Keys Dictionary"
-        })
 
-        
-        public_keys[client_id] = public_key
+async def handle_client(websocket):
+    print("Client terhubung.")
+    try:
+        # Kirim public key ke client
+        await websocket.send(server_public_key.export_key().decode())
+        print("Kunci publik server dikirim ke client.")
 
-       
-        while True:
-            data = receive_message(client_socket)
-            if not data:
-                break
+        # Terima DES key terenkripsi
+        encrypted_des_key = bytes.fromhex(await websocket.recv())
+        rsa_cipher = PKCS1_OAEP.new(server_private_key)
+        des_key = rsa_cipher.decrypt(encrypted_des_key)
+        print(f"DES Key berhasil didekripsi: {des_key.hex()}")
 
-            print(f"Received data from {address} (ID {client_id}): {data}")
+        # Terima pesan terenkripsi
+        encrypted_message = bytes.fromhex(await websocket.recv())
+        des_cipher = DES.new(des_key, DES.MODE_ECB)
+        decrypted_message = unpad(des_cipher.decrypt(encrypted_message), DES.block_size)
+        print(f"Pesan dari Client: {decrypted_message.decode()}")
 
-            if data.get('data') == 'L':
-                send_client_list(client_socket)
-            else:
-                forward_message(client_id, data)
-
+        # Kirim balasan
+        reply = input("Masukkan balasan untuk Client: ").encode()
+        encrypted_reply = des_cipher.encrypt(pad(reply, DES.block_size))
+        await websocket.send(encrypted_reply.hex())
+        print("Balasan terenkripsi berhasil dikirim ke client.")
     except Exception as e:
-        print(f"Error handling client {client_id}: {e}")
-
+        print(f"Terjadi kesalahan: {e}")
     finally:
-        
-        disconnect_client(client_id, client_socket)
+        print("Client terputus.")
 
 
-def send_message(client_socket, message):
-    """Sends a message to client."""
-    try:
-        client_socket.send(json.dumps(message).encode('utf-8'))
-    except Exception as e:
-        print(f"Error sending message: {e}")
+async def main():
+    async with websockets.serve(handle_client, "localhost", 8765):
+        print("Server berjalan di ws://localhost:8765")
+        await asyncio.Future()  # Menjaga server tetap berjalan
 
 
-def receive_message(client_socket):
-    """Receives and decodes a JSON-encoded message from a client."""
-    try:
-        data = client_socket.recv(1024).decode('utf-8')
-        return json.loads(data) if data else None
-    except json.JSONDecodeError as e:
-        print(f"Error decoding message: {e}")
-        return None
-
-
-def notify_clients(client_id, public_key):
-    """Notifies all clients about a new client's public key."""
-    for target_id, client_item_socket in clients.items():
-        if target_id != client_id:
-            send_message(client_item_socket, {
-                'client_id': client_id,
-                'public_key': public_key,
-                'data': f"Public Key for New Client ID: {client_id}"
-            })
-
-
-def send_client_list(client_socket):
-    """Sends a list of connected clients to a specific client."""
-    connected_clients = list(clients.keys())
-    send_message(client_socket, {
-        'data': f"Connected clients: {connected_clients}"
-    })
-
-
-def forward_message(sender_id, data):
-    """Forwards a message to target clients."""
-    target_ids = data.get('target_ids', [])
-    message = data.get('data')
-    step = data.get('step')
-    length = data.get('length')
-
-    for target_id in target_ids:
-        target_socket = clients.get(target_id)
-        if target_socket and target_id != sender_id:
-            send_message(target_socket, {
-                'step': step,
-                'sender_id': sender_id,
-                'data': message,
-                'length': length
-            })
-
-
-def disconnect_client(client_id, client_socket):
-    """Removes a disconnected client."""
-    if client_id in clients:
-        del clients[client_id]
-    if client_id in public_keys:
-        del public_keys[client_id]
-
-    print(f"Connection with client ID {client_id} closed.")
-    client_socket.close()
-
-
-def start_server(host, port):
-    """Server starting and listening for connections."""
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((host, port))
-    server.listen(5)
-    print(f"Server listening on {host}:{port}...")
-
-    try:
-        while True:
-            client_socket, addr = server.accept()
-            client_id = len(clients) + 1
-            clients[client_id] = client_socket
-
-            threading.Thread(
-                target=handle_client, args=(client_socket, addr, client_id)
-            ).start()
-
-    except KeyboardInterrupt:
-        print("Server shutdown.")
-
-    finally:
-        
-        for client_socket in clients.values():
-            client_socket.close()
-        server.close()
-
-
-if __name__ == "__main__":
-    start_server("127.0.0.1", 5001)
+asyncio.run(main())

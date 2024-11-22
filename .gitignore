@@ -1,2 +1,4 @@
-pka_*
-server_*
+pka_public.pem
+pka_private.pem
+server_public.pem
+server_private.pem
